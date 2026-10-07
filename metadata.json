@@ -1,0 +1,11 @@
+{
+  "name": "NādaSakhi – Smart Accessibility Platform",
+  "description": "Smart accessibility hub for deaf and speech-impaired individuals featuring danger-sound alerts (Sound Guardian) and sign language interpretation & captions (SignBridge).",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
