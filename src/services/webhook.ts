@@ -14,6 +14,11 @@ export interface TextToSignPayload {
   text: string;
 }
 
+export interface SignToTextPayload {
+  mode: 'sign_to_text';
+  signs: string[];
+}
+
 export interface WebhookResult {
   success: boolean;
   isJson?: boolean;
@@ -142,3 +147,19 @@ export async function sendTextToSignWebhook(
 
   return await postWebhookJson(payload as unknown as Record<string, unknown>, 10000);
 }
+
+/**
+ * Sends a sign_to_text webhook call with 10-second timeout.
+ * Body: {"mode":"sign_to_text","signs":[...]}
+ */
+export async function sendSignToTextWebhook(
+  signs: string[]
+): Promise<WebhookResult> {
+  const payload: SignToTextPayload = {
+    mode: 'sign_to_text',
+    signs,
+  };
+
+  return await postWebhookJson(payload as unknown as Record<string, unknown>, 10000);
+}
+

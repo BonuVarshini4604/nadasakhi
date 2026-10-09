@@ -189,7 +189,7 @@ export default function App() {
 
   return (
     <div
-      className={`min-h-[100dvh] w-full flex flex-col md:flex-row font-sans transition-colors duration-150 overflow-x-hidden ${textScaleClass} ${
+      className={`h-[100dvh] w-full flex flex-col md:flex-row font-sans transition-colors duration-150 overflow-hidden ${textScaleClass} ${
         highContrast
           ? 'bg-black text-white antialiased'
           : 'bg-[#050b1a] text-[#f8fafc] antialiased'
@@ -211,20 +211,14 @@ export default function App() {
         highContrast={highContrast}
       />
 
-      {/* Main Content Area: Fills remaining space, max width ~1200px, centered with comfortable padding */}
-      <div
-        className={`flex-1 flex flex-col min-w-0 ${
-          currentTab === 'captions'
-            ? 'h-[100dvh] overflow-hidden'
-            : 'min-h-[100dvh] overflow-y-auto'
-        }`}
-      >
+      {/* Main Content Area: Fills remaining space */}
+      <div className="flex-1 min-w-0 min-h-0 flex flex-col h-full overflow-hidden">
         <main
           id="main-content"
-          className={`flex-1 flex flex-col w-full ${
+          className={`flex-1 min-h-0 flex flex-col w-full ${
             currentTab === 'captions'
-              ? 'pb-18 md:pb-0 h-[100dvh] overflow-hidden'
-              : 'pb-24 md:pb-8'
+              ? 'h-full overflow-hidden'
+              : 'overflow-y-auto pb-4 md:pb-8'
           }`}
         >
           {currentTab === 'listen' && (

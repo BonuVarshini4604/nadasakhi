@@ -317,7 +317,7 @@ export const IframeView: React.FC<IframeViewProps> = ({
       )}
 
       {/* Full-Screen Embedded Iframe Area */}
-      <div className="relative flex-1 w-full bg-slate-950 flex flex-col min-h-[calc(100vh-140px)]">
+      <div className="relative flex-1 min-h-0 w-full bg-slate-950 flex flex-col overflow-hidden">
         {/* Loading Overlay */}
         {isLoading && (
           <div
@@ -358,7 +358,8 @@ export const IframeView: React.FC<IframeViewProps> = ({
           sandbox="allow-forms allow-modals allow-popups allow-presentation allow-same-origin allow-scripts allow-downloads"
           loading="eager"
           onLoad={() => setIsLoading(false)}
-          className="w-full flex-1 border-0 h-[calc(100vh-140px)] min-h-[600px]"
+          className="w-full h-full flex-1 min-h-0 border-0"
+          style={{ width: '100%', height: '100%', border: 'none' }}
         />
       </div>
     </main>

@@ -27,17 +27,30 @@ import {
   Globe,
   WifiOff,
   Send,
-  Loader2
+  Loader2,
+  Maximize2
 } from 'lucide-react';
 import { SIGN_BRIDGE_URL } from '../constants';
 import { translateToEnglish } from '../services/translate';
-import { sendTextToSignWebhook, WebhookResult } from '../services/webhook';
+import { sendTextToSignWebhook, sendSignToTextWebhook, WebhookResult } from '../services/webhook';
 import { buildOfflineSignSequence, SignSequenceItem } from '../services/signSequence';
 import { 
   handLandmarkerService, 
   drawHandLandmarks, 
-  classifyHandGesture 
+  classifyHandGesture,
+  GestureSmoother
 } from '../services/handLandmarker';
+import { 
+  SamplePoint,
+  extractHandFeatures,
+  classifyKnn,
+  loadStoredSamples,
+  saveStoredSamples,
+  LetterSmoother,
+  LETTERS_LIST,
+  MOTION_LETTERS
+} from '../services/alphabetClassifier';
+import { LetterTrainingModal } from './LetterTrainingModal';
 import { HandSkeletonPlayer } from './HandSkeletonPlayer';
 
 export type BridgeMode = 'signbridge' | 'sign-to-text' | 'text-to-sign' | 'speech-to-text' | 'dictionary';
@@ -85,7 +98,7 @@ const SIGN_DICTIONARY: DictionaryEntry[] = [
 ];
 
 const PRESET_CHIPS = [
-  'HELLO', 'THANK YOU', 'PLEASE', 'HELP', 'DOCTOR', 'WATER', 'YES', 'NO'
+  'HELLO', 'YES', 'GOOD', 'I LOVE YOU', 'PEACE', 'ONE'
 ];
 
 const QUICK_PHRASES = [
@@ -117,9 +130,16 @@ export const CaptionsTab: React.FC<CaptionsTabProps> = ({
   const [bridgeStatus, setBridgeStatus] = useState<'active' | 'syncing'>('active');
 
   // Sign to Text State
+  const [signSubMode, setSignSubMode] = useState<'words' | 'letters'>('words');
+  const [isTrainingOpen, setIsTrainingOpen] = useState(false);
+  const [letterSamples, setLetterSamples] = useState<SamplePoint[]>(() => loadStoredSamples());
+  const [currentLetterPrediction, setCurrentLetterPrediction] = useState<{ letter: string; confidence: number } | null>(null);
+  const [letterWordOutput, setLetterWordOutput] = useState<string>('');
+
   const [cameraActive, setCameraActive] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
   const [cameraStarting, setCameraStarting] = useState(false);
+  const [isModelLoading, setIsModelLoading] = useState(false);
   const [cameraError, setCameraError] = useState<{
     title: string;
     message: string;
@@ -127,11 +147,11 @@ export const CaptionsTab: React.FC<CaptionsTabProps> = ({
   } | null>(null);
   const [realFps, setRealFps] = useState<number>(0);
   const [activeModelName, setActiveModelName] = useState<string | null>(null);
-  const [detectedGesture, setDetectedGesture] = useState<string>('WAITING FOR GESTURE');
-  const [confidence, setConfidence] = useState<number>(0);
+  const [statusLine, setStatusLine] = useState<string>('No hand detected');
+  const [detectedGesture, setDetectedGesture] = useState<string>('');
+  const [stability, setStability] = useState<number>(0);
   const [signToTextTranscript, setSignToTextTranscript] = useState<string[]>([
-    'Hello',
-    'Thank you for assisting me'
+    'HELLO'
   ]);
 
   // Webcam & Landmark Refs
@@ -141,8 +161,16 @@ export const CaptionsTab: React.FC<CaptionsTabProps> = ({
   const animationFrameRef = useRef<number | null>(null);
   const framesCountRef = useRef<number>(0);
   const lastFpsTimeRef = useRef<number>(0);
-  const lastGestureAddedTimeRef = useRef<number>(0);
-  const lastDetectedGestureRef = useRef<string>('');
+  const smootherRef = useRef<GestureSmoother>(new GestureSmoother());
+  const letterSmootherRef = useRef<LetterSmoother>(new LetterSmoother());
+  const latestLandmarksRef = useRef<import('@mediapipe/tasks-vision').NormalizedLandmark[] | null>(null);
+  const latestIsLeftHandRef = useRef<boolean>(false);
+  const samplesRef = useRef<SamplePoint[]>(letterSamples);
+
+  // Keep samplesRef in sync
+  useEffect(() => {
+    samplesRef.current = letterSamples;
+  }, [letterSamples]);
 
   // Language State: default en-IN (English India), remembered while the app is open
   const [ttsLang, setTtsLang] = useState<LanguageCode>(persistedLanguage);
@@ -487,6 +515,9 @@ export const CaptionsTab: React.FC<CaptionsTabProps> = ({
   const startWebcam = async () => {
     setCameraError(null);
     setCameraStarting(true);
+    smootherRef.current.reset();
+    setStatusLine('Loading hand model...');
+
     try {
       if (streamRef.current) {
         streamRef.current.getTracks().forEach((track) => track.stop());
@@ -494,11 +525,7 @@ export const CaptionsTab: React.FC<CaptionsTabProps> = ({
       }
 
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
-          facingMode: 'user',
-        },
+        video: { facingMode: 'user' },
       });
 
       streamRef.current = stream;
@@ -510,13 +537,28 @@ export const CaptionsTab: React.FC<CaptionsTabProps> = ({
         videoRef.current.onloadedmetadata = () => {
           videoRef.current
             ?.play()
-            .then(() => {
+            .then(async () => {
               setIsStreaming(true);
-              handLandmarkerService.initialize().then((loaded) => {
+              if (!handLandmarkerService.isReady()) {
+                setIsModelLoading(true);
+                const loaded = await handLandmarkerService.initialize();
+                setIsModelLoading(false);
                 if (loaded) {
                   setActiveModelName(handLandmarkerService.getModelName());
+                } else {
+                  setCameraError({
+                    title: 'Model Loading Failed',
+                    message: handLandmarkerService.loadError || 'Failed to load MediaPipe HandLandmarker model',
+                    fixSteps: [
+                      'Check your internet connection to reach storage.googleapis.com and jsdelivr.net.',
+                      'Verify hardware acceleration is enabled in your browser settings.',
+                      'Click "Retry Camera" below to reload the model.'
+                    ],
+                  });
                 }
-              });
+              } else {
+                setActiveModelName(handLandmarkerService.getModelName());
+              }
             })
             .catch((playErr) => {
               console.error('Video play error:', playErr);
@@ -527,6 +569,7 @@ export const CaptionsTab: React.FC<CaptionsTabProps> = ({
       setCameraStarting(false);
       setCameraActive(false);
       setIsStreaming(false);
+      setIsModelLoading(false);
 
       const error = err as Error;
       const errorName = error.name || '';
@@ -589,8 +632,16 @@ export const CaptionsTab: React.FC<CaptionsTabProps> = ({
     }
     setCameraActive(false);
     setIsStreaming(false);
+    setIsModelLoading(false);
     setRealFps(0);
     setActiveModelName(null);
+    setStatusLine('No hand detected');
+    setStability(0);
+    setDetectedGesture('');
+    smootherRef.current.reset();
+    letterSmootherRef.current.reset();
+    latestLandmarksRef.current = null;
+    setCurrentLetterPrediction(null);
     if (canvasRef.current) {
       const ctx = canvasRef.current.getContext('2d');
       if (ctx) ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
@@ -649,37 +700,125 @@ export const CaptionsTab: React.FC<CaptionsTabProps> = ({
           lastFpsTimeRef.current = now;
         }
 
-        if (handLandmarkerService.getModelName() && !activeModelName) {
-          setActiveModelName(handLandmarkerService.getModelName());
-        }
-
-        const landmarksList = handLandmarkerService.detectForVideo(video, now);
         const ctx = canvas.getContext('2d');
 
-        if (ctx) {
-          drawHandLandmarks(ctx, landmarksList || [], canvas.width, canvas.height);
-        }
+        if (!handLandmarkerService.isReady()) {
+          if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+          setStatusLine('Loading hand model...');
+          setStability(0);
+          setDetectedGesture('');
+        } else {
+          if (handLandmarkerService.getModelName() && !activeModelName) {
+            setActiveModelName(handLandmarkerService.getModelName());
+          }
 
-        if (landmarksList && landmarksList.length > 0) {
-          const classification = classifyHandGesture(landmarksList[0]);
-          if (classification) {
-            setDetectedGesture(classification.gesture);
-            setConfidence(classification.confidence);
+          // detectForVideoWithHandedness on each animation frame
+          const detection = handLandmarkerService.detectForVideoWithHandedness(video, now);
+          const landmarks = detection ? detection.landmarks : null;
+          const isLeftHand = detection ? detection.isLeftHand : false;
 
-            const timeSinceLast = now - lastGestureAddedTimeRef.current;
-            if (
-              timeSinceLast > 3000 &&
-              classification.gesture !== lastDetectedGestureRef.current &&
-              classification.gesture !== 'GESTURE DETECTED'
-            ) {
-              lastGestureAddedTimeRef.current = now;
-              lastDetectedGestureRef.current = classification.gesture;
-              setSignToTextTranscript((prev) => [...prev, classification.gesture]);
+          latestLandmarksRef.current = landmarks;
+          latestIsLeftHandRef.current = isLeftHand;
+
+          // Draw landmarks on mirrored canvas. Draws nothing when no hand is detected.
+          if (ctx) {
+            drawHandLandmarks(ctx, landmarks, canvas.width, canvas.height);
+          }
+
+          if (!landmarks) {
+            if (signSubMode === 'words') {
+              smootherRef.current.processFrame(null);
+            } else {
+              letterSmootherRef.current.processFrame(null, now);
+              setCurrentLetterPrediction(null);
+            }
+            setStatusLine('No hand detected');
+            setStability(0);
+            setDetectedGesture('');
+          } else if (signSubMode === 'words') {
+            // MODE: Words (6 still gestures from geometry)
+            const rawGesture = classifyHandGesture(landmarks);
+            const res = smootherRef.current.processFrame(rawGesture);
+
+            setStability(res.stability);
+
+            if (res.acceptedGesture) {
+              // At least 7 of 10 agree
+              setStatusLine(res.acceptedGesture);
+              setDetectedGesture(res.acceptedGesture);
+
+              if (res.isNewChange) {
+                const gestureToAdd = res.acceptedGesture;
+                setSignToTextTranscript((prev) => {
+                  const updated = [...prev, gestureToAdd];
+                  // Send webhook call
+                  sendSignToTextWebhook(updated).catch((err) => {
+                    console.warn('sign_to_text webhook notice:', err);
+                  });
+                  return updated;
+                });
+              }
+            } else {
+              // Hand detected, but fewer than 7 of 10 agree
+              setStatusLine('Hold steady...');
+              setDetectedGesture(res.candidateGesture || '');
+            }
+          } else {
+            // MODE: Letters (k-Nearest-Neighbours classifier on real hand landmarks)
+            // 1. Extract 63-dim feature vector (wrist subtracted, normalized by wrist-middle knuckle distance, mirrored if left hand)
+            const features = extractHandFeatures(landmarks, isLeftHand);
+
+            let rawLetterResult: { letter: string; confidence: number } | null = null;
+            if (features && samplesRef.current.length > 0) {
+              const knnRes = classifyKnn(features, samplesRef.current, 5);
+              if (knnRes) {
+                rawLetterResult = {
+                  letter: knnRes.letter,
+                  confidence: knnRes.confidence,
+                };
+              }
+            }
+
+            setCurrentLetterPrediction(rawLetterResult);
+
+            // 2. Letter smoothing:
+            // - Accept only when confidence >= 0.6 AND at least 7 of 10 frames agree
+            // - Held for 0.8 seconds (800ms)
+            // - Add to output only when it changes (allow repeat only after hand leaves or 1.5s pause)
+            const res = letterSmootherRef.current.processFrame(rawLetterResult, now);
+
+            setStability(res.stability);
+
+            if (res.candidateLetter) {
+              setDetectedGesture(res.candidateLetter);
+            } else {
+              setDetectedGesture('');
+            }
+
+            if (res.candidateLetter && res.stability >= 0.7 && res.confidence >= 0.6) {
+              const pct = Math.round(res.confidence * 100);
+              setStatusLine(`${res.candidateLetter} (${pct}%)`);
+            } else if (res.candidateLetter) {
+              setStatusLine('Hold steady...');
+            } else {
+              setStatusLine('Hold steady...');
+            }
+
+            if (res.isNewConfirmed && res.confirmedLetter) {
+              const newLetter = res.confirmedLetter;
+              // Append letter to word output
+              setLetterWordOutput((prev) => prev + newLetter);
+
+              // Also append to transcript and send webhook
+              setSignToTextTranscript((prev) => {
+                const updated = [...prev, newLetter];
+                sendSignToTextWebhook(updated).catch((err) => {
+                  console.warn('sign_to_text letters webhook notice:', err);
+                });
+                return updated;
+              });
             }
           }
-        } else {
-          setDetectedGesture('WAITING FOR GESTURE');
-          setConfidence(0);
         }
       }
 
@@ -695,12 +834,17 @@ export const CaptionsTab: React.FC<CaptionsTabProps> = ({
         animationFrameRef.current = null;
       }
     };
-  }, [isStreaming]);
+  }, [isStreaming, signSubMode]);
 
   const simulateDetectGesture = (word: string) => {
+    setStatusLine(word);
     setDetectedGesture(word);
-    setConfidence(Math.floor(Math.random() * 8) + 92);
-    setSignToTextTranscript((prev) => [...prev, word]);
+    setStability(1.0);
+    setSignToTextTranscript((prev) => {
+      const updated = [...prev, word];
+      sendSignToTextWebhook(updated).catch(() => {});
+      return updated;
+    });
   };
 
   const currentStep = expandedSteps[currentStepIndex] || expandedSteps[0];
@@ -719,8 +863,8 @@ export const CaptionsTab: React.FC<CaptionsTabProps> = ({
     <div
       className={`w-full select-none bg-[#050b1a] text-[#f8fafc] ${
         mode === 'signbridge'
-          ? 'flex flex-col h-full w-full p-2 sm:p-3 md:p-4 overflow-hidden'
-          : 'max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-4 sm:py-6 lg:py-8 space-y-6 overflow-y-auto min-h-full pb-20 md:pb-8'
+          ? 'flex-1 min-h-0 flex flex-col h-full w-full p-2 sm:p-3 md:p-4 overflow-hidden'
+          : 'max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-4 sm:py-6 lg:py-8 space-y-6 overflow-y-auto flex-1 min-h-0 pb-6 md:pb-8'
       }`}
     >
       {/* 1. Bridge Status Indicator & Header */}
@@ -799,264 +943,504 @@ export const CaptionsTab: React.FC<CaptionsTabProps> = ({
         })}
       </div>
 
-      {/* MODE 0: SIGNBRIDGE VIEW (Fills all available space: full width, calc(100dvh minus header and tab bar), no extra inner scrolling area, no double scrollbar, rounded corners, thin dark theme border, allow="camera; microphone; autoplay; fullscreen") */}
+      {/* 3. Mobile-only large "Open full screen" button above the iframe on phones */}
       {mode === 'signbridge' && (
-        <div
-          className="w-full flex-1 min-h-0 flex flex-col mt-2 sm:mt-2.5 overflow-hidden"
-          style={{
-            height: 'calc(100dvh - var(--header-tabbar-offset, 13rem))',
-          }}
+        <a
+          href="https://sign-bridge-1.ai.studio"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="md:hidden shrink-0 mt-2 sm:mt-2.5 w-full min-h-[48px] py-3.5 px-4 rounded-2xl font-black text-sm bg-gradient-to-r from-[#0ea5e9] to-[#0284c7] hover:from-sky-400 hover:to-sky-500 text-white shadow-[0_0_20px_rgba(14,165,233,0.35)] flex items-center justify-center gap-2.5 transition-all cursor-pointer border border-sky-400/40 active:scale-[0.99]"
         >
-          <div
-            className={`w-full h-full flex-1 min-h-0 rounded-2xl md:rounded-3xl border ${
-              highContrast ? 'border-amber-400 bg-black' : 'border-[#1a274c] bg-[#050b1a]'
-            } overflow-hidden shadow-2xl relative`}
-          >
-            <iframe
-              key={iframeKey}
-              src={SIGN_BRIDGE_URL}
-              title="SignBridge AI Workspace"
-              allow="camera; microphone; autoplay; fullscreen"
-              className="w-full h-full border-0 block bg-[#050b1a]"
-            />
-          </div>
+          <Maximize2 className="w-4 h-4 stroke-[2.5]" />
+          <span>Open full screen</span>
+          <ExternalLink className="w-3.5 h-3.5 opacity-90" />
+        </a>
+      )}
+
+      {/* MODE 0: SIGNBRIDGE VIEW (Fills all remaining height: flex: 1, min-height: 0, width: 100%, height: 100%, no border) */}
+      {mode === 'signbridge' && (
+        <div className="w-full flex-1 min-h-0 flex flex-col mt-2 sm:mt-2.5 overflow-hidden rounded-2xl md:rounded-3xl border-0">
+          <iframe
+            key={iframeKey}
+            src="https://sign-bridge-1.ai.studio"
+            title="SignBridge AI Workspace"
+            allow="camera; microphone; autoplay; fullscreen"
+            className="w-full h-full flex-1 min-h-0 border-0 block bg-[#050b1a]"
+            style={{ width: '100%', height: '100%', border: 'none' }}
+          />
         </div>
       )}
 
       {/* MODE 1: SIGN TO TEXT */}
       {mode === 'sign-to-text' && (
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-          {/* Black hand viewer box with subtle cyan glow border */}
-          <div className="lg:col-span-7 space-y-4">
-            <div className="relative w-full rounded-3xl bg-black border border-sky-400/40 shadow-[0_0_30px_rgba(14,165,233,0.25)] min-h-[360px] sm:min-h-[440px] flex flex-col items-center justify-center overflow-hidden">
-              {/* Corner cyan tech brackets */}
-              <div className="absolute top-4 left-4 w-6 h-6 border-t-2 border-l-2 border-[#0ea5e9] rounded-tl-lg pointer-events-none z-20" />
-              <div className="absolute top-4 right-4 w-6 h-6 border-t-2 border-r-2 border-[#0ea5e9] rounded-tr-lg pointer-events-none z-20" />
-              <div className="absolute bottom-16 left-4 w-6 h-6 border-b-2 border-l-2 border-[#0ea5e9] rounded-bl-lg pointer-events-none z-20" />
-              <div className="absolute bottom-16 right-4 w-6 h-6 border-b-2 border-r-2 border-[#0ea5e9] rounded-br-lg pointer-events-none z-20" />
-
-              {/* Live Video Element: Mirrored, fills the box, autoplay, muted, playsInline */}
-              <video
-                ref={videoRef}
-                autoPlay
-                muted
-                playsInline
-                className={`absolute inset-0 w-full h-full object-cover -scale-x-100 transition-opacity duration-300 ${
-                  isStreaming ? 'opacity-100' : 'opacity-0 pointer-events-none'
+        <div className="space-y-4">
+          {/* 1. Mode switch above the camera: "Words" (existing) and "Letters" (new) + "Teach letters" button */}
+          <div className="flex items-center justify-between flex-wrap gap-2.5 p-3 rounded-2xl bg-[#0d1630] border border-[#1a274c]">
+            <div className="flex items-center gap-1.5 p-1 bg-[#050b1a] rounded-xl border border-[#1a274c]">
+              <button
+                type="button"
+                onClick={() => {
+                  setSignSubMode('words');
+                  smootherRef.current.reset();
+                  letterSmootherRef.current.reset();
+                  setStatusLine(isStreaming ? 'Hold steady...' : 'No hand detected');
+                }}
+                className={`px-4 py-2 rounded-lg text-xs font-black transition-all cursor-pointer ${
+                  signSubMode === 'words'
+                    ? 'bg-[#0ea5e9] text-white shadow-[0_0_15px_rgba(14,165,233,0.4)]'
+                    : 'text-[#94a3b8] hover:text-white'
                 }`}
-              />
-
-              {/* Hand Landmarks Canvas Overlay on top of video */}
-              <canvas
-                ref={canvasRef}
-                className={`absolute inset-0 w-full h-full object-cover -scale-x-100 pointer-events-none z-10 transition-opacity duration-300 ${
-                  isStreaming ? 'opacity-100' : 'opacity-0'
+              >
+                Words
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setSignSubMode('letters');
+                  smootherRef.current.reset();
+                  letterSmootherRef.current.reset();
+                  setStatusLine(isStreaming ? 'Hold steady...' : 'No hand detected');
+                }}
+                className={`px-4 py-2 rounded-lg text-xs font-black transition-all cursor-pointer ${
+                  signSubMode === 'letters'
+                    ? 'bg-[#0ea5e9] text-white shadow-[0_0_15px_rgba(14,165,233,0.4)]'
+                    : 'text-[#94a3b8] hover:text-white'
                 }`}
-              />
-
-              {/* Floating Top HUD when streaming */}
-              {isStreaming && (
-                <div className="absolute top-4 left-1/2 -translate-x-1/2 z-20 flex items-center gap-2">
-                  <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-[#050b1a]/85 backdrop-blur-md border border-sky-400/50 shadow-[0_0_20px_rgba(14,165,233,0.3)] text-xs font-bold text-white">
-                    <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-                    <span className="tracking-wide uppercase font-black">{detectedGesture}</span>
-                    {confidence > 0 && (
-                      <span className="font-mono text-emerald-400 font-extrabold text-[11px]">
-                        ({confidence}%)
-                      </span>
-                    )}
-                  </div>
-                </div>
-              )}
-
-              {/* Camera Error Message: Permission denied or no camera found */}
-              {cameraError && (
-                <div className="relative z-20 w-[92%] max-w-md p-5 rounded-2xl bg-[#1e0a14]/95 backdrop-blur-md border border-rose-500/70 shadow-[0_0_35px_rgba(244,63,94,0.35)] text-left space-y-3.5 my-6">
-                  <div className="flex items-start gap-3">
-                    <div className="p-2.5 rounded-xl bg-rose-950 text-rose-300 border border-rose-500/50 shrink-0">
-                      <AlertTriangle className="w-5 h-5 text-rose-400" />
-                    </div>
-                    <div className="min-w-0">
-                      <h4 className="text-sm font-black text-rose-100 uppercase tracking-wide">
-                        {cameraError.title}
-                      </h4>
-                      <p className="text-xs text-rose-200/90 mt-1 font-medium leading-relaxed">
-                        {cameraError.message}
-                      </p>
-                    </div>
-                  </div>
-
-                  <div className="p-3.5 rounded-xl bg-black/60 border border-rose-900/60 space-y-2 text-xs text-rose-200/90">
-                    <p className="font-extrabold text-rose-300 uppercase tracking-wider text-[10px]">
-                      How to fix:
-                    </p>
-                    <ol className="list-decimal list-inside space-y-1.5 text-[11px] leading-relaxed text-rose-100/90">
-                      {cameraError.fixSteps.map((step, idx) => (
-                        <li key={idx}>{step}</li>
-                      ))}
-                    </ol>
-                  </div>
-
-                  <div className="flex items-center gap-2 pt-1">
-                    <button
-                      onClick={startWebcam}
-                      className="px-4 py-2 rounded-xl text-xs font-black bg-rose-600 hover:bg-rose-500 text-white flex items-center gap-1.5 transition-colors cursor-pointer shadow-md"
-                    >
-                      <RotateCw className="w-3.5 h-3.5" />
-                      <span>Retry Camera</span>
-                    </button>
-                    <button
-                      onClick={() => setCameraError(null)}
-                      className="px-3.5 py-2 rounded-xl text-xs font-bold bg-[#050b1a] hover:bg-[#131e3d] text-[#94a3b8] hover:text-white border border-[#1a274c] transition-colors cursor-pointer"
-                    >
-                      Dismiss
-                    </button>
-                  </div>
-                </div>
-              )}
-
-              {/* Hand emoji shown ONLY when camera is NOT playing and no error */}
-              {!isStreaming && !cameraError && (
-                <div className="relative z-10 flex flex-col items-center justify-center text-center space-y-4 p-6">
-                  <div className="w-28 h-28 sm:w-36 sm:h-36 rounded-full bg-[#0d1630]/90 border border-sky-400/50 flex items-center justify-center shadow-[0_0_35px_rgba(14,165,233,0.3)]">
-                    <span className="text-5xl sm:text-7xl">✋</span>
-                  </div>
-
-                  <div className="space-y-1">
-                    <div className="inline-flex items-center gap-2 px-3.5 py-1 rounded-full bg-[#0d1630] border border-[#1a274c] text-xs font-bold text-[#0ea5e9]">
-                      <Sparkles className="w-3.5 h-3.5" />
-                      <span>Neural Hand Landmarker 21 Keypoints</span>
-                    </div>
-                    <h3 className="text-xl sm:text-2xl font-black text-white">
-                      Waiting for gesture
-                    </h3>
-                    <p className="text-xs text-[#94a3b8] max-w-xs font-medium">
-                      Press &quot;Start Webcam&quot; below to enable live video and real-time hand gesture recognition.
-                    </p>
-                  </div>
-                </div>
-              )}
-
-              {/* Camera toggle bar & real FPS / Model info */}
-              <div className="absolute bottom-3 left-4 right-4 flex items-center justify-between z-20 bg-[#050b1a]/85 backdrop-blur-md px-3.5 py-2 rounded-2xl border border-[#1a274c]">
-                <button
-                  onClick={cameraActive ? stopWebcam : startWebcam}
-                  disabled={cameraStarting}
-                  className={`px-3.5 py-2 rounded-xl text-xs font-bold flex items-center gap-2 border transition-all cursor-pointer ${
-                    cameraActive
-                      ? 'bg-rose-950/80 text-rose-300 border-rose-500/50 hover:bg-rose-900/90'
-                      : 'bg-[#0d1630] text-[#0ea5e9] hover:text-white border-sky-500/40 hover:bg-[#131e3d]'
-                  } disabled:opacity-50`}
-                >
-                  {cameraStarting ? (
-                    <>
-                      <Loader2 className="w-3.5 h-3.5 animate-spin text-[#0ea5e9]" />
-                      <span>Starting Camera...</span>
-                    </>
-                  ) : cameraActive ? (
-                    <>
-                      <CameraOff className="w-3.5 h-3.5 text-rose-400" />
-                      <span>Stop Webcam</span>
-                    </>
-                  ) : (
-                    <>
-                      <Camera className="w-3.5 h-3.5 text-[#0ea5e9]" />
-                      <span>Start Webcam</span>
-                    </>
-                  )}
-                </button>
-
-                {/* Show the real frame rate and the real model name, or remove those labels if they are not real */}
-                <div className="text-[11px] font-mono text-[#94a3b8] flex items-center gap-1.5 flex-wrap justify-end">
-                  {isStreaming ? (
-                    <>
-                      <span className="text-emerald-400 font-bold">FPS: {realFps}</span>
-                      {activeModelName ? (
-                        <>
-                          <span className="text-slate-600">·</span>
-                          <span className="text-sky-300 font-medium">Model: {activeModelName}</span>
-                        </>
-                      ) : null}
-                    </>
-                  ) : (
-                    <span className="text-slate-400">Camera: Inactive</span>
-                  )}
-                </div>
-              </div>
+              >
+                Letters
+              </button>
             </div>
 
-            {/* Preset Gesture Simulator Chips */}
-            <div className="p-5 rounded-3xl bg-[#0d1630] border border-[#1a274c] space-y-2.5">
-              <p className="text-xs font-extrabold uppercase tracking-wider text-[#94a3b8]">
-                Quick Preset Chips (Click to test gesture recognition)
-              </p>
-              <div className="flex flex-wrap gap-2">
-                {PRESET_CHIPS.map((chip) => (
-                  <button
-                    key={chip}
-                    onClick={() => simulateDetectGesture(chip)}
-                    className="px-3.5 py-2 rounded-xl text-xs font-black bg-[#050b1a] hover:bg-[#131e3d] text-[#f8fafc] border border-[#1a274c] hover:border-[#0ea5e9] transition-all cursor-pointer"
-                  >
-                    {chip}
-                  </button>
-                ))}
-              </div>
+            <div className="flex items-center gap-2">
+              {signSubMode === 'letters' && (
+                <button
+                  type="button"
+                  onClick={() => setIsTrainingOpen(true)}
+                  className="px-3.5 py-2 rounded-xl text-xs font-black bg-[#050b1a] hover:bg-[#131e3d] text-[#0ea5e9] hover:text-white border border-[#1a274c] hover:border-[#0ea5e9] flex items-center gap-1.5 transition-all cursor-pointer shadow-xs"
+                >
+                  <Sparkles className="w-3.5 h-3.5 text-[#0ea5e9]" />
+                  <span>Teach letters</span>
+                  <span className="text-[10px] font-mono px-1.5 py-0.2 bg-sky-950/70 border border-sky-500/30 rounded text-sky-300">
+                    {letterSamples.length} samples
+                  </span>
+                </button>
+              )}
             </div>
           </div>
 
-          {/* Right Column: Live Transcript and Output */}
-          <div className="lg:col-span-5 space-y-4">
-            <div className="p-6 rounded-3xl bg-[#0d1630] border border-[#1a274c] space-y-4 shadow-lg">
-              <div className="flex items-center justify-between pb-3 border-b border-[#1a274c]">
-                <h3 className="text-sm font-black uppercase tracking-wider text-[#f8fafc]">
-                  Translated Spoken Output
-                </h3>
-                <div className="flex items-center gap-1.5">
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+            {/* Black hand viewer box with subtle cyan glow border */}
+            <div className="lg:col-span-7 space-y-4">
+              <div className="relative w-full rounded-3xl bg-black border border-sky-400/40 shadow-[0_0_30px_rgba(14,165,233,0.25)] min-h-[360px] sm:min-h-[440px] flex flex-col items-center justify-center overflow-hidden">
+                {/* Corner cyan tech brackets */}
+                <div className="absolute top-4 left-4 w-6 h-6 border-t-2 border-l-2 border-[#0ea5e9] rounded-tl-lg pointer-events-none z-20" />
+                <div className="absolute top-4 right-4 w-6 h-6 border-t-2 border-r-2 border-[#0ea5e9] rounded-tr-lg pointer-events-none z-20" />
+                <div className="absolute bottom-16 left-4 w-6 h-6 border-b-2 border-l-2 border-[#0ea5e9] rounded-bl-lg pointer-events-none z-20" />
+                <div className="absolute bottom-16 right-4 w-6 h-6 border-b-2 border-r-2 border-[#0ea5e9] rounded-br-lg pointer-events-none z-20" />
+
+                {/* Live Video Element: Mirrored, fills the box, autoplay, muted, playsInline */}
+                <video
+                  ref={videoRef}
+                  autoPlay
+                  muted
+                  playsInline
+                  className={`absolute inset-0 w-full h-full object-cover -scale-x-100 transition-opacity duration-300 ${
+                    isStreaming ? 'opacity-100' : 'opacity-0 pointer-events-none'
+                  }`}
+                />
+
+                {/* Hand Landmarks Canvas Overlay on top of video */}
+                <canvas
+                  ref={canvasRef}
+                  className={`absolute inset-0 w-full h-full object-cover -scale-x-100 pointer-events-none z-10 transition-opacity duration-300 ${
+                    isStreaming ? 'opacity-100' : 'opacity-0'
+                  }`}
+                />
+
+                {/* Floating Top HUD when streaming: Status line ("No hand detected", "Hold steady...", or recognised sign) and stability */}
+                {isStreaming && (
+                  <div className="absolute top-4 left-1/2 -translate-x-1/2 z-20 flex flex-col items-center gap-1.5 max-w-[92%]">
+                    <div className="inline-flex items-center gap-2.5 px-4 py-1.5 rounded-full bg-[#050b1a]/90 backdrop-blur-md border border-sky-400/50 shadow-[0_0_20px_rgba(14,165,233,0.3)] text-xs font-bold text-white">
+                      <span
+                        className={`w-2.5 h-2.5 rounded-full ${
+                          statusLine === 'No hand detected'
+                            ? 'bg-slate-400'
+                            : statusLine === 'Hold steady...' || isModelLoading
+                            ? 'bg-amber-400 animate-pulse'
+                            : 'bg-emerald-400 animate-pulse'
+                        }`}
+                      />
+                      <span className="tracking-wide uppercase font-black">
+                        {isModelLoading ? 'Loading hand model...' : statusLine}
+                      </span>
+                      {stability > 0 && (
+                        <span className="font-mono text-emerald-400 font-extrabold text-[11px] bg-emerald-950/70 px-2 py-0.5 rounded border border-emerald-500/30">
+                          Stability: {stability.toFixed(1)}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {/* Camera Error Message: Permission denied or no camera found */}
+                {cameraError && (
+                  <div className="relative z-20 w-[92%] max-w-md p-5 rounded-2xl bg-[#1e0a14]/95 backdrop-blur-md border border-rose-500/70 shadow-[0_0_35px_rgba(244,63,94,0.35)] text-left space-y-3.5 my-6">
+                    <div className="flex items-start gap-3">
+                      <div className="p-2.5 rounded-xl bg-rose-950 text-rose-300 border border-rose-500/50 shrink-0">
+                        <AlertTriangle className="w-5 h-5 text-rose-400" />
+                      </div>
+                      <div className="min-w-0">
+                        <h4 className="text-sm font-black text-rose-100 uppercase tracking-wide">
+                          {cameraError.title}
+                        </h4>
+                        <p className="text-xs text-rose-200/90 mt-1 font-medium leading-relaxed">
+                          {cameraError.message}
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="p-3.5 rounded-xl bg-black/60 border border-rose-900/60 space-y-2 text-xs text-rose-200/90">
+                      <p className="font-extrabold text-rose-300 uppercase tracking-wider text-[10px]">
+                        How to fix:
+                      </p>
+                      <ol className="list-decimal list-inside space-y-1.5 text-[11px] leading-relaxed text-rose-100/90">
+                        {cameraError.fixSteps.map((step, idx) => (
+                          <li key={idx}>{step}</li>
+                        ))}
+                      </ol>
+                    </div>
+
+                    <div className="flex items-center gap-2 pt-1">
+                      <button
+                        onClick={startWebcam}
+                        className="px-4 py-2 rounded-xl text-xs font-black bg-rose-600 hover:bg-rose-500 text-white flex items-center gap-1.5 transition-colors cursor-pointer shadow-md"
+                      >
+                        <RotateCw className="w-3.5 h-3.5" />
+                        <span>Retry Camera</span>
+                      </button>
+                      <button
+                        onClick={() => setCameraError(null)}
+                        className="px-3.5 py-2 rounded-xl text-xs font-bold bg-[#050b1a] hover:bg-[#131e3d] text-[#94a3b8] hover:text-white border border-[#1a274c] transition-colors cursor-pointer"
+                      >
+                        Dismiss
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {/* Hand emoji shown ONLY when camera is NOT playing and no error */}
+                {!isStreaming && !cameraError && (
+                  <div className="relative z-10 flex flex-col items-center justify-center text-center space-y-4 p-6">
+                    <div className="w-28 h-28 sm:w-36 sm:h-36 rounded-full bg-[#0d1630]/90 border border-sky-400/50 flex items-center justify-center shadow-[0_0_35px_rgba(14,165,233,0.3)]">
+                      <span className="text-5xl sm:text-7xl">✋</span>
+                    </div>
+
+                    <div className="space-y-1">
+                      <div className="inline-flex items-center gap-2 px-3.5 py-1 rounded-full bg-[#0d1630] border border-[#1a274c] text-xs font-bold text-[#0ea5e9]">
+                        <Sparkles className="w-3.5 h-3.5" />
+                        <span>
+                          {signSubMode === 'letters'
+                            ? 'k-NN Alphabet Classifier (21 Keypoints)'
+                            : 'Neural Hand Landmarker 21 Keypoints'}
+                        </span>
+                      </div>
+                      <h3 className="text-xl sm:text-2xl font-black text-white">
+                        {signSubMode === 'letters' ? 'Waiting for letter sign' : 'Waiting for gesture'}
+                      </h3>
+                      <p className="text-xs text-[#94a3b8] max-w-xs font-medium">
+                        Press &quot;Start Webcam&quot; below to enable live video and real-time hand recognition.
+                      </p>
+                    </div>
+                  </div>
+                )}
+
+                {/* Camera toggle bar & real FPS / Model info */}
+                <div className="absolute bottom-3 left-4 right-4 flex items-center justify-between z-20 bg-[#050b1a]/85 backdrop-blur-md px-3.5 py-2 rounded-2xl border border-[#1a274c]">
                   <button
-                    onClick={() => {
-                      navigator.clipboard?.writeText(signToTextTranscript.join(' '));
-                      setCopied(true);
-                      setTimeout(() => setCopied(false), 2000);
-                    }}
-                    title="Copy transcript"
-                    className="p-1.5 rounded-lg bg-[#050b1a] border border-[#1a274c] text-[#94a3b8] hover:text-white cursor-pointer"
+                    onClick={cameraActive ? stopWebcam : startWebcam}
+                    disabled={cameraStarting}
+                    className={`px-3.5 py-2 rounded-xl text-xs font-bold flex items-center gap-2 border transition-all cursor-pointer ${
+                      cameraActive
+                        ? 'bg-rose-950/80 text-rose-300 border-rose-500/50 hover:bg-rose-900/90'
+                        : 'bg-[#0d1630] text-[#0ea5e9] hover:text-white border-sky-500/40 hover:bg-[#131e3d]'
+                    } disabled:opacity-50`}
                   >
-                    {copied ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                    {cameraStarting ? (
+                      <>
+                        <Loader2 className="w-3.5 h-3.5 animate-spin text-[#0ea5e9]" />
+                        <span>Starting Camera...</span>
+                      </>
+                    ) : cameraActive ? (
+                      <>
+                        <CameraOff className="w-3.5 h-3.5 text-rose-400" />
+                        <span>Stop Webcam</span>
+                      </>
+                    ) : (
+                      <>
+                        <Camera className="w-3.5 h-3.5 text-[#0ea5e9]" />
+                        <span>Start Webcam</span>
+                      </>
+                    )}
                   </button>
-                  <button
-                    onClick={() => setSignToTextTranscript([])}
-                    title="Clear transcript"
-                    className="p-1.5 rounded-lg bg-[#050b1a] border border-[#1a274c] text-[#94a3b8] hover:text-rose-400 cursor-pointer"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                  </button>
+
+                  {/* Show the real frame rate and the real model name, or remove those labels if they are not real */}
+                  <div className="text-[11px] font-mono text-[#94a3b8] flex items-center gap-1.5 flex-wrap justify-end">
+                    {isStreaming ? (
+                      <>
+                        <span className="text-emerald-400 font-bold">FPS: {realFps}</span>
+                        {activeModelName ? (
+                          <>
+                            <span className="text-slate-600">·</span>
+                            <span className="text-sky-300 font-medium">Model: {activeModelName}</span>
+                          </>
+                        ) : null}
+                      </>
+                    ) : (
+                      <span className="text-slate-400">Camera: Inactive</span>
+                    )}
+                  </div>
                 </div>
               </div>
 
-              <div className="p-4 rounded-2xl bg-[#050b1a] border border-[#1a274c] min-h-[220px] max-h-[320px] overflow-y-auto space-y-2">
-                {signToTextTranscript.length === 0 ? (
-                  <p className="text-xs text-[#94a3b8] italic">No gestures recognized yet. Make a sign or click preset chips.</p>
-                ) : (
-                  signToTextTranscript.map((t, idx) => (
-                    <p key={idx} className="text-base sm:text-lg font-bold text-[#f8fafc]">
-                      {t}
-                    </p>
-                  ))
-                )}
-              </div>
+              {/* Note under the camera: Words mode note or Letters mode honesty note */}
+              {signSubMode === 'words' ? (
+                <div className="p-4 rounded-2xl bg-[#0d1630] border border-[#1a274c] space-y-2">
+                  <div className="flex items-center gap-2 text-xs font-bold text-sky-400">
+                    <Sparkles className="w-4 h-4 text-sky-400 shrink-0" />
+                    <span>Prototype: recognises 6 still gestures</span>
+                  </div>
+                  <p className="text-[11px] text-[#94a3b8] leading-relaxed">
+                    HELLO (all 5 fingers extended) · YES (closed fist) · GOOD (thumb up only) · I LOVE YOU (thumb + index + pinky) · PEACE (index + middle) · ONE (index only).
+                  </p>
+                </div>
+              ) : (
+                <div className="p-4 rounded-2xl bg-[#0d1630] border border-[#1a274c] space-y-2">
+                  <div className="flex items-center gap-2 text-xs font-bold text-sky-400">
+                    <Sparkles className="w-4 h-4 text-sky-400 shrink-0" />
+                    <span>Alphabet Recognition (A–Z)</span>
+                  </div>
+                  <p className="text-[11px] text-[#94a3b8] leading-relaxed">
+                    Prototype: letters are learned from the user&apos;s own samples. Accuracy depends on training, lighting and hand position. J and Z need motion and are not supported yet.
+                  </p>
+                </div>
+              )}
 
-              {/* Text-to-Speech synthesis trigger */}
-              <button
-                onClick={() => {
-                  const speech = new SpeechSynthesisUtterance(signToTextTranscript.join(' '));
-                  window.speechSynthesis?.speak(speech);
-                }}
-                disabled={signToTextTranscript.length === 0}
-                className="w-full py-3.5 px-4 rounded-2xl font-black text-sm bg-[#0ea5e9] hover:bg-sky-400 text-white flex items-center justify-center gap-2 transition-all cursor-pointer disabled:opacity-50"
-              >
-                <Volume2 className="w-4 h-4" />
-                <span>Speak Output Aloud</span>
-              </button>
+              {/* Preset Gesture Simulator Chips (Only in Words mode) or Letters Trainer shortcut */}
+              {signSubMode === 'words' ? (
+                <div className="p-5 rounded-3xl bg-[#0d1630] border border-[#1a274c] space-y-2.5">
+                  <p className="text-xs font-extrabold uppercase tracking-wider text-[#94a3b8]">
+                    Quick Preset Chips (Click to test gesture recognition)
+                  </p>
+                  <div className="flex flex-wrap gap-2">
+                    {PRESET_CHIPS.map((chip) => (
+                      <button
+                        key={chip}
+                        onClick={() => simulateDetectGesture(chip)}
+                        className="px-3.5 py-2 rounded-xl text-xs font-black bg-[#050b1a] hover:bg-[#131e3d] text-[#f8fafc] border border-[#1a274c] hover:border-[#0ea5e9] transition-all cursor-pointer"
+                      >
+                        {chip}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <div className="p-5 rounded-3xl bg-[#0d1630] border border-[#1a274c] space-y-3">
+                  <div className="flex items-center justify-between">
+                    <p className="text-xs font-extrabold uppercase tracking-wider text-[#94a3b8]">
+                      Alphabet Quick Test Keys (Click to test or spell)
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => setIsTrainingOpen(true)}
+                      className="text-xs font-bold text-[#0ea5e9] hover:underline"
+                    >
+                      Open Training Grid →
+                    </button>
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {LETTERS_LIST.map((char) => {
+                      const isMotion = MOTION_LETTERS.has(char);
+                      return (
+                        <button
+                          key={char}
+                          onClick={() => {
+                            if (isMotion) return;
+                            setLetterWordOutput((prev) => prev + char);
+                            setSignToTextTranscript((prev) => {
+                              const updated = [...prev, char];
+                              sendSignToTextWebhook(updated).catch(() => {});
+                              return updated;
+                            });
+                          }}
+                          disabled={isMotion}
+                          title={isMotion ? 'J and Z need motion and are not supported yet' : `Add letter ${char}`}
+                          className={`w-8 h-8 rounded-lg text-xs font-black transition-all cursor-pointer border flex items-center justify-center ${
+                            isMotion
+                              ? 'bg-[#050b1a]/40 text-slate-600 border-slate-800 cursor-not-allowed'
+                              : 'bg-[#050b1a] hover:bg-[#131e3d] text-[#f8fafc] border-[#1a274c] hover:border-[#0ea5e9]'
+                          }`}
+                        >
+                          {char}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Right Column: Live Transcript and Output */}
+            <div className="lg:col-span-5 space-y-4">
+              {/* If Letters mode: Show the current letter large, with its stability value, and built word with Space, Backspace, Clear, Speak */}
+              {signSubMode === 'letters' && (
+                <div className="p-5 sm:p-6 rounded-3xl bg-[#0d1630] border border-[#1a274c] space-y-4 shadow-lg">
+                  <div className="flex items-center justify-between pb-3 border-b border-[#1a274c]">
+                    <h3 className="text-xs font-extrabold uppercase tracking-wider text-[#94a3b8]">
+                      Active Letter Detection
+                    </h3>
+                    <div className="flex items-center gap-2">
+                      <span className="text-[11px] font-mono text-emerald-400 bg-emerald-950/70 border border-emerald-500/30 px-2 py-0.5 rounded font-bold">
+                        Stability: {stability.toFixed(1)}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Large Current Letter Display */}
+                  <div className="flex items-center justify-center py-4 bg-[#050b1a] rounded-2xl border border-[#1a274c]">
+                    <div className="flex flex-col items-center">
+                      <span className="text-6xl sm:text-7xl font-black text-white tracking-widest font-mono">
+                        {currentLetterPrediction?.letter || (detectedGesture.length === 1 ? detectedGesture : '—')}
+                      </span>
+                      <span className="text-xs text-[#94a3b8] mt-2 font-medium">
+                        {currentLetterPrediction
+                          ? `Confidence: ${Math.round(currentLetterPrediction.confidence * 100)}%`
+                          : isStreaming
+                          ? 'Hold letter steady for 0.8s'
+                          : 'Camera off'}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Word Built From Confirmed Letters */}
+                  <div className="space-y-2">
+                    <label className="text-xs font-extrabold uppercase tracking-wider text-[#94a3b8] block">
+                      Spelled Word / Phrase
+                    </label>
+                    <div className="p-3.5 rounded-xl bg-[#050b1a] border border-[#1a274c] min-h-[56px] flex items-center justify-between flex-wrap gap-2">
+                      <span className="text-lg sm:text-xl font-mono font-bold text-sky-300 break-all">
+                        {letterWordOutput || <span className="text-slate-600 italic text-sm">Spelled letters will appear here...</span>}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Controls: Space, Backspace, Clear, Speak */}
+                  <div className="grid grid-cols-4 gap-2 pt-1">
+                    <button
+                      type="button"
+                      onClick={() => setLetterWordOutput((prev) => prev + ' ')}
+                      className="py-2.5 px-3 rounded-xl text-xs font-bold bg-[#050b1a] hover:bg-[#131e3d] text-[#f8fafc] border border-[#1a274c] hover:border-[#0ea5e9] transition-all cursor-pointer"
+                    >
+                      Space
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setLetterWordOutput((prev) => prev.slice(0, -1))}
+                      disabled={letterWordOutput.length === 0}
+                      className="py-2.5 px-3 rounded-xl text-xs font-bold bg-[#050b1a] hover:bg-[#131e3d] text-[#f8fafc] border border-[#1a274c] hover:border-rose-400 transition-all cursor-pointer disabled:opacity-40"
+                    >
+                      Backspace
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setLetterWordOutput('')}
+                      disabled={letterWordOutput.length === 0}
+                      className="py-2.5 px-3 rounded-xl text-xs font-bold bg-[#050b1a] hover:bg-[#131e3d] text-rose-400 border border-[#1a274c] hover:border-rose-500/50 transition-all cursor-pointer disabled:opacity-40"
+                    >
+                      Clear
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (!letterWordOutput.trim()) return;
+                        const speech = new SpeechSynthesisUtterance(letterWordOutput);
+                        window.speechSynthesis?.speak(speech);
+                      }}
+                      disabled={letterWordOutput.trim().length === 0}
+                      className="py-2.5 px-3 rounded-xl text-xs font-black bg-[#0ea5e9] hover:bg-sky-400 text-white flex items-center justify-center gap-1.5 transition-all cursor-pointer disabled:opacity-40"
+                    >
+                      <Volume2 className="w-3.5 h-3.5" />
+                      <span>Speak</span>
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* General Live Transcript and Output */}
+              <div className="p-6 rounded-3xl bg-[#0d1630] border border-[#1a274c] space-y-4 shadow-lg">
+                <div className="flex items-center justify-between pb-3 border-b border-[#1a274c]">
+                  <h3 className="text-sm font-black uppercase tracking-wider text-[#f8fafc]">
+                    Translated Spoken Output
+                  </h3>
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      onClick={() => {
+                        const textToCopy = signSubMode === 'letters' && letterWordOutput
+                          ? letterWordOutput
+                          : signToTextTranscript.join(' ');
+                        navigator.clipboard?.writeText(textToCopy);
+                        setCopied(true);
+                        setTimeout(() => setCopied(false), 2000);
+                      }}
+                      title="Copy transcript"
+                      className="p-1.5 rounded-lg bg-[#050b1a] border border-[#1a274c] text-[#94a3b8] hover:text-white cursor-pointer"
+                    >
+                      {copied ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                    </button>
+                    <button
+                      onClick={() => {
+                        setSignToTextTranscript([]);
+                        setLetterWordOutput('');
+                      }}
+                      title="Clear transcript"
+                      className="p-1.5 rounded-lg bg-[#050b1a] border border-[#1a274c] text-[#94a3b8] hover:text-rose-400 cursor-pointer"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                </div>
+
+                <div className="p-4 rounded-2xl bg-[#050b1a] border border-[#1a274c] min-h-[180px] max-h-[260px] overflow-y-auto space-y-2">
+                  {signToTextTranscript.length === 0 ? (
+                    <p className="text-xs text-[#94a3b8] italic">
+                      {signSubMode === 'letters'
+                        ? 'No letters recognized yet. Show hand in camera or use test keys.'
+                        : 'No gestures recognized yet. Make a sign or click preset chips.'}
+                    </p>
+                  ) : (
+                    signToTextTranscript.map((t, idx) => (
+                      <p key={idx} className="text-base sm:text-lg font-bold text-[#f8fafc]">
+                        {t}
+                      </p>
+                    ))
+                  )}
+                </div>
+
+                {/* Text-to-Speech synthesis trigger */}
+                <button
+                  onClick={() => {
+                    const textToSpeak = signSubMode === 'letters' && letterWordOutput
+                      ? letterWordOutput
+                      : signToTextTranscript.join(' ');
+                    const speech = new SpeechSynthesisUtterance(textToSpeak);
+                    window.speechSynthesis?.speak(speech);
+                  }}
+                  disabled={signToTextTranscript.length === 0 && letterWordOutput.length === 0}
+                  className="w-full py-3.5 px-4 rounded-2xl font-black text-sm bg-[#0ea5e9] hover:bg-sky-400 text-white flex items-center justify-center gap-2 transition-all cursor-pointer disabled:opacity-50"
+                >
+                  <Volume2 className="w-4 h-4" />
+                  <span>Speak Output Aloud</span>
+                </button>
+              </div>
             </div>
           </div>
         </div>
@@ -1698,6 +2082,20 @@ export const CaptionsTab: React.FC<CaptionsTabProps> = ({
           </div>
         </div>
       )}
+
+      {/* Teach Letters Modal */}
+      <LetterTrainingModal
+        isOpen={isTrainingOpen}
+        onClose={() => setIsTrainingOpen(false)}
+        samples={letterSamples}
+        onSamplesChange={(newSamples) => {
+          setLetterSamples(newSamples);
+          saveStoredSamples(newSamples);
+        }}
+        latestLandmarksRef={latestLandmarksRef}
+        latestIsLeftHandRef={latestIsLeftHandRef}
+        isCameraActive={cameraActive && isStreaming}
+      />
     </div>
   );
 };

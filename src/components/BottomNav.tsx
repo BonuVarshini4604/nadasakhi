@@ -45,7 +45,7 @@ export const BottomNav: React.FC<BottomNavProps> = ({
     <nav
       role="navigation"
       aria-label="Bottom Navigation"
-      className={`md:hidden fixed bottom-0 left-0 right-0 z-40 border-t backdrop-blur-xl transition-colors duration-150 ${
+      className={`md:hidden shrink-0 z-40 border-t backdrop-blur-xl transition-colors duration-150 w-full ${
         highContrast
           ? 'bg-black/95 border-amber-400 text-white'
           : 'bg-[#070f24]/95 border-[#1a274c] text-[#94a3b8]'
