@@ -68,7 +68,7 @@ function buildPose(config: {
  */
 
 // Resting default open palm
-const REST_POSE = buildPose({
+export const REST_POSE = buildPose({
   thumb:  [[0.43, 0.74, 0.02], [0.36, 0.65, 0.03], [0.31, 0.56, 0.04], [0.27, 0.49, 0.05]],
   index:  [[0.44, 0.52, 0.00], [0.42, 0.38, -0.01], [0.41, 0.28, -0.01], [0.40, 0.18, -0.01]],
   middle: [[0.50, 0.50, 0.00], [0.50, 0.35, -0.02], [0.50, 0.24, -0.02], [0.50, 0.14, -0.02]],

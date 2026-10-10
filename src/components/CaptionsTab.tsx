@@ -28,7 +28,9 @@ import {
   WifiOff,
   Send,
   Loader2,
-  Maximize2
+  Maximize2,
+  Eye,
+  EyeOff
 } from 'lucide-react';
 import { SIGN_BRIDGE_URL } from '../constants';
 import { translateToEnglish } from '../services/translate';
@@ -42,13 +44,22 @@ import {
 } from '../services/handLandmarker';
 import { 
   SamplePoint,
+  MotionSample,
+  StoredTrainingData,
   extractHandFeatures,
   classifyKnn,
-  loadStoredSamples,
-  saveStoredSamples,
+  loadStoredData,
+  saveStoredData,
   LetterSmoother,
   LETTERS_LIST,
-  MOTION_LETTERS
+  MOTION_LETTERS,
+  NEUTRAL_LABEL,
+  resampleAndNormalizePath,
+  matchMotionSample,
+  checkHandQuality,
+  calculateLetterThresholds,
+  LetterThresholdInfo,
+  ClassificationResult
 } from '../services/alphabetClassifier';
 import { LetterTrainingModal } from './LetterTrainingModal';
 import { HandSkeletonPlayer } from './HandSkeletonPlayer';
@@ -129,12 +140,25 @@ export const CaptionsTab: React.FC<CaptionsTabProps> = ({
   // Bridge Status State
   const [bridgeStatus, setBridgeStatus] = useState<'active' | 'syncing'>('active');
 
-  // Sign to Text State
-  const [signSubMode, setSignSubMode] = useState<'words' | 'letters'>('words');
+  // Sign to Text State: 'words' | 'letters' (offline) | 'type-letters'
+  const [signSubMode, setSignSubMode] = useState<'words' | 'letters' | 'type-letters'>('words');
   const [isTrainingOpen, setIsTrainingOpen] = useState(false);
-  const [letterSamples, setLetterSamples] = useState<SamplePoint[]>(() => loadStoredSamples());
-  const [currentLetterPrediction, setCurrentLetterPrediction] = useState<{ letter: string; confidence: number } | null>(null);
+  const [showModelVision, setShowModelVision] = useState(false);
+  
+  // Stored training data (both still samples and motion samples)
+  const [trainingData, setTrainingData] = useState<StoredTrainingData>(() => loadStoredData());
+  const [currentLetterPrediction, setCurrentLetterPrediction] = useState<ClassificationResult | null>(null);
   const [letterWordOutput, setLetterWordOutput] = useState<string>('');
+
+  // Cached thresholds for still letters
+  const cachedThresholdsRef = useRef<Record<string, LetterThresholdInfo>>({});
+  const prevDetectionLandmarksRef = useRef<import('@mediapipe/tasks-vision').NormalizedLandmark[] | null>(null);
+
+  // Motion tracking state (for J and Z live trail and matching)
+  const [motionTrailPoints, setMotionTrailPoints] = useState<[number, number][]>([]);
+  const liveTrailRef = useRef<{ x: number; y: number; time: number }[]>([]);
+  const liveNormMotionRef = useRef<[number, number][]>([]);
+  const lastMotionMatchTimeRef = useRef<number>(0);
 
   const [cameraActive, setCameraActive] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
@@ -165,12 +189,13 @@ export const CaptionsTab: React.FC<CaptionsTabProps> = ({
   const letterSmootherRef = useRef<LetterSmoother>(new LetterSmoother());
   const latestLandmarksRef = useRef<import('@mediapipe/tasks-vision').NormalizedLandmark[] | null>(null);
   const latestIsLeftHandRef = useRef<boolean>(false);
-  const samplesRef = useRef<SamplePoint[]>(letterSamples);
+  const trainingDataRef = useRef<StoredTrainingData>(trainingData);
 
-  // Keep samplesRef in sync
+  // Keep trainingDataRef and thresholds in sync
   useEffect(() => {
-    samplesRef.current = letterSamples;
-  }, [letterSamples]);
+    trainingDataRef.current = trainingData;
+    cachedThresholdsRef.current = calculateLetterThresholds(trainingData.stillSamples);
+  }, [trainingData]);
 
   // Language State: default en-IN (English India), remembered while the app is open
   const [ttsLang, setTtsLang] = useState<LanguageCode>(persistedLanguage);
@@ -525,7 +550,12 @@ export const CaptionsTab: React.FC<CaptionsTabProps> = ({
       }
 
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'user' },
+        video: {
+          facingMode: 'user',
+          width: { ideal: 640 },
+          height: { ideal: 480 },
+          frameRate: { ideal: 30 },
+        },
       });
 
       streamRef.current = stream;
@@ -550,9 +580,10 @@ export const CaptionsTab: React.FC<CaptionsTabProps> = ({
                     title: 'Model Loading Failed',
                     message: handLandmarkerService.loadError || 'Failed to load MediaPipe HandLandmarker model',
                     fixSteps: [
+                      'Open this page once with internet to load the hand model.',
                       'Check your internet connection to reach storage.googleapis.com and jsdelivr.net.',
                       'Verify hardware acceleration is enabled in your browser settings.',
-                      'Click "Retry Camera" below to reload the model.'
+                      'Click "Retry Camera" below once connected.'
                     ],
                   });
                 }
@@ -642,6 +673,9 @@ export const CaptionsTab: React.FC<CaptionsTabProps> = ({
     letterSmootherRef.current.reset();
     latestLandmarksRef.current = null;
     setCurrentLetterPrediction(null);
+    liveTrailRef.current = [];
+    liveNormMotionRef.current = [];
+    setMotionTrailPoints([]);
     if (canvasRef.current) {
       const ctx = canvasRef.current.getContext('2d');
       if (ctx) ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
@@ -654,6 +688,36 @@ export const CaptionsTab: React.FC<CaptionsTabProps> = ({
       stopWebcam();
     }
   }, [mode]);
+
+  // Physical keyboard listener for Type letters or Letters mode (Item 9)
+  useEffect(() => {
+    if (mode !== 'sign-to-text') return;
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Don't intercept if user is typing in an input or textarea
+      const target = e.target as HTMLElement | null;
+      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) {
+        return;
+      }
+
+      if (e.key === 'Backspace') {
+        e.preventDefault();
+        setLetterWordOutput((prev) => prev.slice(0, -1));
+      } else if (e.key === ' ' || e.code === 'Space') {
+        e.preventDefault();
+        setLetterWordOutput((prev) => prev + ' ');
+      } else if (/^[a-zA-Z]$/.test(e.key)) {
+        const char = e.key.toUpperCase();
+        setLetterWordOutput((prev) => prev + char);
+        setSignToTextTranscript((prev) => [...prev, char]);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [mode, signSubMode]);
 
   // Clean up media stream and animation frames on unmount
   useEffect(() => {
@@ -720,16 +784,79 @@ export const CaptionsTab: React.FC<CaptionsTabProps> = ({
           latestLandmarksRef.current = landmarks;
           latestIsLeftHandRef.current = isLeftHand;
 
-          // Draw landmarks on mirrored canvas. Draws nothing when no hand is detected.
+          // Track motion trail and fingertip positions if in letters mode
+          let activeTrailPoints: [number, number][] | undefined = undefined;
+
+          if (landmarks && signSubMode === 'letters') {
+            const wrist = landmarks[0];
+            const middleMcp = landmarks[9];
+            const scale = Math.hypot(
+              middleMcp.x - wrist.x,
+              middleMcp.y - wrist.y,
+              (middleMcp.z || 0) - (wrist.z || 0)
+            ) || 1.0;
+
+            // Use index tip (8) for trail rendering
+            const indexTip = landmarks[8];
+            liveTrailRef.current.push({ x: indexTip.x, y: indexTip.y, time: now });
+            // Keep points from last 1.5 seconds
+            liveTrailRef.current = liveTrailRef.current.filter((pt) => now - pt.time <= 1500);
+
+            let relX = (indexTip.x - wrist.x) / scale;
+            const relY = (indexTip.y - wrist.y) / scale;
+            if (isLeftHand) relX = -relX;
+
+            liveNormMotionRef.current.push([relX, relY]);
+            if (liveNormMotionRef.current.length > 50) {
+              liveNormMotionRef.current.shift();
+            }
+
+            if (liveTrailRef.current.length > 2) {
+              activeTrailPoints = liveTrailRef.current.map((pt) => [pt.x, pt.y]);
+            }
+          } else {
+            liveTrailRef.current = [];
+            liveNormMotionRef.current = [];
+          }
+
+          // Compute live quality of hand (for green/red ring and stillness)
+          const quality = checkHandQuality(landmarks, prevDetectionLandmarksRef.current);
+          prevDetectionLandmarksRef.current = landmarks;
+          const isHandStill = quality.isStill;
+
+          let knnRes: ClassificationResult | null = null;
+          if (landmarks && signSubMode === 'letters') {
+            const features = extractHandFeatures(landmarks, isLeftHand);
+            const currentStillSamples = trainingDataRef.current.stillSamples;
+            if (features && currentStillSamples.length > 0) {
+              knnRes = classifyKnn(features, currentStillSamples, 5, cachedThresholdsRef.current);
+            }
+          }
+
+          // Draw landmarks and motion trail on mirrored canvas. Draws nothing when no hand is detected.
           if (ctx) {
-            drawHandLandmarks(ctx, landmarks, canvas.width, canvas.height);
+            drawHandLandmarks(ctx, landmarks, canvas.width, canvas.height, {
+              motionTrail: activeTrailPoints,
+              showModelVision,
+              modelVisionInfo: knnRes ? {
+                nearestLetter: knnRes.candidateLetter,
+                distance: knnRes.distance,
+                threshold: knnRes.threshold,
+                confidence: knnRes.confidence,
+                isStill: isHandStill,
+              } : undefined,
+              qualityRing: signSubMode === 'letters' && landmarks ? {
+                ringColor: quality.ringColor,
+                reason: quality.reason,
+              } : undefined,
+            });
           }
 
           if (!landmarks) {
             if (signSubMode === 'words') {
               smootherRef.current.processFrame(null);
             } else {
-              letterSmootherRef.current.processFrame(null, now);
+              letterSmootherRef.current.processFrame(null, false, now);
               setCurrentLetterPrediction(null);
             }
             setStatusLine('No hand detected');
@@ -763,60 +890,72 @@ export const CaptionsTab: React.FC<CaptionsTabProps> = ({
               setStatusLine('Hold steady...');
               setDetectedGesture(res.candidateGesture || '');
             }
-          } else {
-            // MODE: Letters (k-Nearest-Neighbours classifier on real hand landmarks)
-            // 1. Extract 63-dim feature vector (wrist subtracted, normalized by wrist-middle knuckle distance, mirrored if left hand)
-            const features = extractHandFeatures(landmarks, isLeftHand);
+          } else if (signSubMode === 'letters') {
+            // MODE: Letters (offline)
+            // Check for motion match (J or Z) if we have enough points in the motion window
+            let motionMatched: { letter: 'J' | 'Z'; distance: number; threshold: number } | null = null;
+            const currentMotions = trainingDataRef.current.motionSamples;
 
-            let rawLetterResult: { letter: string; confidence: number } | null = null;
-            if (features && samplesRef.current.length > 0) {
-              const knnRes = classifyKnn(features, samplesRef.current, 5);
-              if (knnRes) {
-                rawLetterResult = {
-                  letter: knnRes.letter,
-                  confidence: knnRes.confidence,
-                };
-              }
+            if (
+              currentMotions.length > 0 &&
+              liveNormMotionRef.current.length >= 16 &&
+              now - lastMotionMatchTimeRef.current >= 1500
+            ) {
+              const resampledCand = resampleAndNormalizePath(liveNormMotionRef.current, 16);
+              motionMatched = matchMotionSample(resampledCand, currentMotions);
             }
 
-            setCurrentLetterPrediction(rawLetterResult);
-
-            // 2. Letter smoothing:
-            // - Accept only when confidence >= 0.6 AND at least 7 of 10 frames agree
-            // - Held for 0.8 seconds (800ms)
-            // - Add to output only when it changes (allow repeat only after hand leaves or 1.5s pause)
-            const res = letterSmootherRef.current.processFrame(rawLetterResult, now);
-
-            setStability(res.stability);
-
-            if (res.candidateLetter) {
-              setDetectedGesture(res.candidateLetter);
-            } else {
-              setDetectedGesture('');
-            }
-
-            if (res.candidateLetter && res.stability >= 0.7 && res.confidence >= 0.6) {
-              const pct = Math.round(res.confidence * 100);
-              setStatusLine(`${res.candidateLetter} (${pct}%)`);
-            } else if (res.candidateLetter) {
-              setStatusLine('Hold steady...');
-            } else {
-              setStatusLine('Hold steady...');
-            }
-
-            if (res.isNewConfirmed && res.confirmedLetter) {
-              const newLetter = res.confirmedLetter;
-              // Append letter to word output
-              setLetterWordOutput((prev) => prev + newLetter);
-
-              // Also append to transcript and send webhook
-              setSignToTextTranscript((prev) => {
-                const updated = [...prev, newLetter];
-                sendSignToTextWebhook(updated).catch((err) => {
-                  console.warn('sign_to_text letters webhook notice:', err);
+            if (motionMatched) {
+              const matchedChar = motionMatched.letter;
+              const confirmed = letterSmootherRef.current.confirmMotionLetter(matchedChar, now);
+              if (confirmed) {
+                lastMotionMatchTimeRef.current = now;
+                liveTrailRef.current = [];
+                liveNormMotionRef.current = [];
+                setStatusLine(`${matchedChar} (motion)`);
+                setDetectedGesture(matchedChar);
+                setStability(1.0);
+                setLetterWordOutput((prev) => prev + matchedChar);
+                setSignToTextTranscript((prev) => {
+                  const updated = [...prev, matchedChar];
+                  return updated;
                 });
-                return updated;
-              });
+              }
+            } else {
+              setCurrentLetterPrediction(knnRes);
+
+              // 4. Strict letter confirmation:
+              // - 9 of 12 agree, confidence >= 0.7, still for 0.8s
+              // - ignores moving frames
+              // - if NEUTRAL class wins, shows "Ready" and adds nothing
+              // - if uncertain ("?"), shows "?" and adds nothing
+              const res = letterSmootherRef.current.processFrame(knnRes, isHandStill, now);
+
+              setStability(res.stability);
+              setDetectedGesture(res.displayLetter);
+
+              if (res.displayLetter === 'Ready') {
+                setStatusLine('Ready (hand at rest)');
+              } else if (res.displayLetter === '?') {
+                setStatusLine('? (Uncertain sign)');
+              } else if (res.candidateLetter && res.stability >= 0.75 && res.confidence >= 0.7) {
+                const pct = Math.round(res.confidence * 100);
+                setStatusLine(`${res.candidateLetter} (${pct}%)`);
+              } else if (res.candidateLetter) {
+                setStatusLine('Hold steady...');
+              } else {
+                setStatusLine('Hold steady...');
+              }
+
+              if (res.isNewConfirmed && res.confirmedLetter) {
+                const newLetter = res.confirmedLetter;
+                setLetterWordOutput((prev) => prev + newLetter);
+
+                setSignToTextTranscript((prev) => {
+                  const updated = [...prev, newLetter];
+                  return updated;
+                });
+              }
             }
           }
         }
@@ -834,7 +973,7 @@ export const CaptionsTab: React.FC<CaptionsTabProps> = ({
         animationFrameRef.current = null;
       }
     };
-  }, [isStreaming, signSubMode]);
+  }, [isStreaming, signSubMode, showModelVision]);
 
   const simulateDetectGesture = (word: string) => {
     setStatusLine(word);
@@ -974,18 +1113,20 @@ export const CaptionsTab: React.FC<CaptionsTabProps> = ({
       {/* MODE 1: SIGN TO TEXT */}
       {mode === 'sign-to-text' && (
         <div className="space-y-4">
-          {/* 1. Mode switch above the camera: "Words" (existing) and "Letters" (new) + "Teach letters" button */}
+          {/* 1. MODE SWITCH: above the camera, three options: Words, Letters (offline), and Type letters + Offline badge */}
           <div className="flex items-center justify-between flex-wrap gap-2.5 p-3 rounded-2xl bg-[#0d1630] border border-[#1a274c]">
-            <div className="flex items-center gap-1.5 p-1 bg-[#050b1a] rounded-xl border border-[#1a274c]">
+            <div className="flex items-center gap-1.5 p-1 bg-[#050b1a] rounded-xl border border-[#1a274c] overflow-x-auto scrollbar-none">
               <button
                 type="button"
                 onClick={() => {
                   setSignSubMode('words');
                   smootherRef.current.reset();
                   letterSmootherRef.current.reset();
+                  liveTrailRef.current = [];
+                  liveNormMotionRef.current = [];
                   setStatusLine(isStreaming ? 'Hold steady...' : 'No hand detected');
                 }}
-                className={`px-4 py-2 rounded-lg text-xs font-black transition-all cursor-pointer ${
+                className={`px-3.5 sm:px-4 py-2 rounded-lg text-xs font-black transition-all cursor-pointer whitespace-nowrap ${
                   signSubMode === 'words'
                     ? 'bg-[#0ea5e9] text-white shadow-[0_0_15px_rgba(14,165,233,0.4)]'
                     : 'text-[#94a3b8] hover:text-white'
@@ -999,37 +1140,80 @@ export const CaptionsTab: React.FC<CaptionsTabProps> = ({
                   setSignSubMode('letters');
                   smootherRef.current.reset();
                   letterSmootherRef.current.reset();
+                  liveTrailRef.current = [];
+                  liveNormMotionRef.current = [];
                   setStatusLine(isStreaming ? 'Hold steady...' : 'No hand detected');
                 }}
-                className={`px-4 py-2 rounded-lg text-xs font-black transition-all cursor-pointer ${
+                className={`px-3.5 sm:px-4 py-2 rounded-lg text-xs font-black transition-all cursor-pointer whitespace-nowrap ${
                   signSubMode === 'letters'
                     ? 'bg-[#0ea5e9] text-white shadow-[0_0_15px_rgba(14,165,233,0.4)]'
                     : 'text-[#94a3b8] hover:text-white'
                 }`}
               >
-                Letters
+                Letters (offline)
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setSignSubMode('type-letters');
+                  setStatusLine('Keyboard ready');
+                }}
+                className={`px-3.5 sm:px-4 py-2 rounded-lg text-xs font-black transition-all cursor-pointer whitespace-nowrap ${
+                  signSubMode === 'type-letters'
+                    ? 'bg-[#0ea5e9] text-white shadow-[0_0_15px_rgba(14,165,233,0.4)]'
+                    : 'text-[#94a3b8] hover:text-white'
+                }`}
+              >
+                Type letters
               </button>
             </div>
 
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
+              {/* Requirement 10: Offline status badge */}
+              {(signSubMode === 'letters' || signSubMode === 'type-letters') && (
+                <div className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-950/60 border border-emerald-500/40 text-[11px] font-bold text-emerald-300">
+                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                  <span>Offline mode: recognition runs on this device</span>
+                </div>
+              )}
+
               {signSubMode === 'letters' && (
-                <button
-                  type="button"
-                  onClick={() => setIsTrainingOpen(true)}
-                  className="px-3.5 py-2 rounded-xl text-xs font-black bg-[#050b1a] hover:bg-[#131e3d] text-[#0ea5e9] hover:text-white border border-[#1a274c] hover:border-[#0ea5e9] flex items-center gap-1.5 transition-all cursor-pointer shadow-xs"
-                >
-                  <Sparkles className="w-3.5 h-3.5 text-[#0ea5e9]" />
-                  <span>Teach letters</span>
-                  <span className="text-[10px] font-mono px-1.5 py-0.2 bg-sky-950/70 border border-sky-500/30 rounded text-sky-300">
-                    {letterSamples.length} samples
-                  </span>
-                </button>
+                <>
+                  <button
+                    type="button"
+                    onClick={() => setShowModelVision((v) => !v)}
+                    className={`px-3 py-2 rounded-xl text-xs font-bold border flex items-center gap-1.5 transition-all cursor-pointer shadow-xs ${
+                      showModelVision
+                        ? 'bg-amber-500/20 text-amber-300 border-amber-400/60 shadow-[0_0_12px_rgba(245,158,11,0.3)]'
+                        : 'bg-[#050b1a] text-[#94a3b8] hover:text-white border-[#1a274c] hover:border-amber-400/40'
+                    }`}
+                    title="Toggle diagnostic overlay: joint numbers, nearest training neighbor distance and threshold"
+                  >
+                    <Eye className="w-3.5 h-3.5 text-amber-400" />
+                    <span>Show what model sees</span>
+                    <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-amber-950/80 border border-amber-500/30 text-amber-300">
+                      {showModelVision ? 'ON' : 'OFF'}
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setIsTrainingOpen(true)}
+                    className="px-3.5 py-2 rounded-xl text-xs font-black bg-[#050b1a] hover:bg-[#131e3d] text-[#0ea5e9] hover:text-white border border-[#1a274c] hover:border-[#0ea5e9] flex items-center gap-1.5 transition-all cursor-pointer shadow-xs"
+                  >
+                    <Sparkles className="w-3.5 h-3.5 text-[#0ea5e9]" />
+                    <span>Teach letters</span>
+                    <span className="text-[10px] font-mono px-1.5 py-0.2 bg-sky-950/70 border border-sky-500/30 rounded text-sky-300">
+                      {trainingData.stillSamples.length + trainingData.motionSamples.length}
+                    </span>
+                  </button>
+                </>
               )}
             </div>
           </div>
 
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-            {/* Black hand viewer box with subtle cyan glow border */}
+            {/* Left Column: Camera / Hand Tracker Box (or Keyboard info when in Type letters) */}
             <div className="lg:col-span-7 space-y-4">
               <div className="relative w-full rounded-3xl bg-black border border-sky-400/40 shadow-[0_0_30px_rgba(14,165,233,0.25)] min-h-[360px] sm:min-h-[440px] flex flex-col items-center justify-center overflow-hidden">
                 {/* Corner cyan tech brackets */}
@@ -1140,15 +1324,23 @@ export const CaptionsTab: React.FC<CaptionsTabProps> = ({
                         <Sparkles className="w-3.5 h-3.5" />
                         <span>
                           {signSubMode === 'letters'
-                            ? 'k-NN Alphabet Classifier (21 Keypoints)'
+                            ? 'Offline k-NN Letters (A–Z) & Motion Trails'
+                            : signSubMode === 'type-letters'
+                            ? 'Direct Keyboard Input & Speller'
                             : 'Neural Hand Landmarker 21 Keypoints'}
                         </span>
                       </div>
                       <h3 className="text-xl sm:text-2xl font-black text-white">
-                        {signSubMode === 'letters' ? 'Waiting for letter sign' : 'Waiting for gesture'}
+                        {signSubMode === 'type-letters'
+                          ? 'Type letters directly below'
+                          : signSubMode === 'letters'
+                          ? 'Waiting for letter sign'
+                          : 'Waiting for gesture'}
                       </h3>
                       <p className="text-xs text-[#94a3b8] max-w-xs font-medium">
-                        Press &quot;Start Webcam&quot; below to enable live video and real-time hand recognition.
+                        {signSubMode === 'type-letters'
+                          ? 'Use the on-screen keyboard below or press keys on your physical keyboard.'
+                          : 'Press "Start Webcam" below to enable live video and real-time hand recognition.'}
                       </p>
                     </div>
                   </div>
@@ -1183,7 +1375,7 @@ export const CaptionsTab: React.FC<CaptionsTabProps> = ({
                     )}
                   </button>
 
-                  {/* Show the real frame rate and the real model name, or remove those labels if they are not real */}
+                  {/* Real frame rate and model name */}
                   <div className="text-[11px] font-mono text-[#94a3b8] flex items-center gap-1.5 flex-wrap justify-end">
                     {isStreaming ? (
                       <>
@@ -1202,7 +1394,7 @@ export const CaptionsTab: React.FC<CaptionsTabProps> = ({
                 </div>
               </div>
 
-              {/* Note under the camera: Words mode note or Letters mode honesty note */}
+              {/* Requirement 11: Honesty Note under the camera */}
               {signSubMode === 'words' ? (
                 <div className="p-4 rounded-2xl bg-[#0d1630] border border-[#1a274c] space-y-2">
                   <div className="flex items-center gap-2 text-xs font-bold text-sky-400">
@@ -1213,19 +1405,29 @@ export const CaptionsTab: React.FC<CaptionsTabProps> = ({
                     HELLO (all 5 fingers extended) · YES (closed fist) · GOOD (thumb up only) · I LOVE YOU (thumb + index + pinky) · PEACE (index + middle) · ONE (index only).
                   </p>
                 </div>
-              ) : (
+              ) : signSubMode === 'letters' ? (
                 <div className="p-4 rounded-2xl bg-[#0d1630] border border-[#1a274c] space-y-2">
                   <div className="flex items-center gap-2 text-xs font-bold text-sky-400">
                     <Sparkles className="w-4 h-4 text-sky-400 shrink-0" />
                     <span>Alphabet Recognition (A–Z)</span>
                   </div>
                   <p className="text-[11px] text-[#94a3b8] leading-relaxed">
-                    Prototype: letters are learned from the user&apos;s own samples. Accuracy depends on training, lighting and hand position. J and Z need motion and are not supported yet.
+                    Prototype: runs 100% offline in browser with no backend or API calls. Recognises still letters A-Y using k-NN and motion letters J and Z using fingertip trajectory matching. Letters are learned from the user&apos;s own recorded samples.
+                  </p>
+                </div>
+              ) : (
+                <div className="p-4 rounded-2xl bg-[#0d1630] border border-[#1a274c] space-y-2">
+                  <div className="flex items-center gap-2 text-xs font-bold text-sky-400">
+                    <Type className="w-4 h-4 text-sky-400 shrink-0" />
+                    <span>Type Letters Backup Mode</span>
+                  </div>
+                  <p className="text-[11px] text-[#94a3b8] leading-relaxed">
+                    Tap the on-screen keyboard below or type using your physical keyboard. All letters are placed into the same output box.
                   </p>
                 </div>
               )}
 
-              {/* Preset Gesture Simulator Chips (Only in Words mode) or Letters Trainer shortcut */}
+              {/* Preset Chips (Words mode) OR Keyboard (Type letters mode) OR Quick Keys (Letters mode) */}
               {signSubMode === 'words' ? (
                 <div className="p-5 rounded-3xl bg-[#0d1630] border border-[#1a274c] space-y-2.5">
                   <p className="text-xs font-extrabold uppercase tracking-wider text-[#94a3b8]">
@@ -1244,46 +1446,63 @@ export const CaptionsTab: React.FC<CaptionsTabProps> = ({
                   </div>
                 </div>
               ) : (
+                /* Requirement 9: On-screen A to Z keyboard with Space and Backspace */
                 <div className="p-5 rounded-3xl bg-[#0d1630] border border-[#1a274c] space-y-3">
                   <div className="flex items-center justify-between">
                     <p className="text-xs font-extrabold uppercase tracking-wider text-[#94a3b8]">
-                      Alphabet Quick Test Keys (Click to test or spell)
+                      {signSubMode === 'type-letters'
+                        ? 'On-Screen A to Z Keyboard (Physical keyboard also supported)'
+                        : 'Alphabet Quick Test Keys (Click to test or spell)'}
                     </p>
-                    <button
-                      type="button"
-                      onClick={() => setIsTrainingOpen(true)}
-                      className="text-xs font-bold text-[#0ea5e9] hover:underline"
-                    >
-                      Open Training Grid →
-                    </button>
+                    {signSubMode === 'letters' && (
+                      <button
+                        type="button"
+                        onClick={() => setIsTrainingOpen(true)}
+                        className="text-xs font-bold text-[#0ea5e9] hover:underline"
+                      >
+                        Open Training Grid →
+                      </button>
+                    )}
                   </div>
-                  <div className="flex flex-wrap gap-1.5">
+
+                  {/* A to Z grid keyboard */}
+                  <div className="grid grid-cols-7 sm:grid-cols-9 md:grid-cols-13 gap-1.5 sm:gap-2">
                     {LETTERS_LIST.map((char) => {
                       const isMotion = MOTION_LETTERS.has(char);
                       return (
                         <button
                           key={char}
+                          type="button"
                           onClick={() => {
-                            if (isMotion) return;
                             setLetterWordOutput((prev) => prev + char);
-                            setSignToTextTranscript((prev) => {
-                              const updated = [...prev, char];
-                              sendSignToTextWebhook(updated).catch(() => {});
-                              return updated;
-                            });
+                            setSignToTextTranscript((prev) => [...prev, char]);
                           }}
-                          disabled={isMotion}
-                          title={isMotion ? 'J and Z need motion and are not supported yet' : `Add letter ${char}`}
-                          className={`w-8 h-8 rounded-lg text-xs font-black transition-all cursor-pointer border flex items-center justify-center ${
-                            isMotion
-                              ? 'bg-[#050b1a]/40 text-slate-600 border-slate-800 cursor-not-allowed'
-                              : 'bg-[#050b1a] hover:bg-[#131e3d] text-[#f8fafc] border-[#1a274c] hover:border-[#0ea5e9]'
-                          }`}
+                          title={`Add letter ${char}${isMotion ? ' (motion letter)' : ''}`}
+                          className="h-10 rounded-xl text-sm font-black transition-all cursor-pointer border bg-[#050b1a] hover:bg-[#131e3d] text-[#f8fafc] border-[#1a274c] hover:border-[#0ea5e9] flex items-center justify-center active:scale-95 shadow-xs"
                         >
                           {char}
                         </button>
                       );
                     })}
+                  </div>
+
+                  {/* Space & Backspace buttons for the keyboard */}
+                  <div className="flex items-center gap-2 pt-1">
+                    <button
+                      type="button"
+                      onClick={() => setLetterWordOutput((prev) => prev + ' ')}
+                      className="flex-1 py-3 px-4 rounded-xl text-xs font-extrabold bg-[#050b1a] hover:bg-[#131e3d] text-[#f8fafc] border border-[#1a274c] hover:border-[#0ea5e9] transition-all cursor-pointer shadow-xs"
+                    >
+                      Space
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setLetterWordOutput((prev) => prev.slice(0, -1))}
+                      disabled={letterWordOutput.length === 0}
+                      className="py-3 px-6 rounded-xl text-xs font-extrabold bg-[#050b1a] hover:bg-[#131e3d] text-[#f8fafc] border border-[#1a274c] hover:border-rose-400 transition-all cursor-pointer disabled:opacity-40 shadow-xs"
+                    >
+                      Backspace
+                    </button>
                   </div>
                 </div>
               )}
@@ -1291,12 +1510,12 @@ export const CaptionsTab: React.FC<CaptionsTabProps> = ({
 
             {/* Right Column: Live Transcript and Output */}
             <div className="lg:col-span-5 space-y-4">
-              {/* If Letters mode: Show the current letter large, with its stability value, and built word with Space, Backspace, Clear, Speak */}
-              {signSubMode === 'letters' && (
+              {/* Output for Letters mode or Type letters mode */}
+              {(signSubMode === 'letters' || signSubMode === 'type-letters') && (
                 <div className="p-5 sm:p-6 rounded-3xl bg-[#0d1630] border border-[#1a274c] space-y-4 shadow-lg">
                   <div className="flex items-center justify-between pb-3 border-b border-[#1a274c]">
                     <h3 className="text-xs font-extrabold uppercase tracking-wider text-[#94a3b8]">
-                      Active Letter Detection
+                      {signSubMode === 'letters' ? 'Active Letter Detection' : 'Current Selected Letter'}
                     </h3>
                     <div className="flex items-center gap-2">
                       <span className="text-[11px] font-mono text-emerald-400 bg-emerald-950/70 border border-emerald-500/30 px-2 py-0.5 rounded font-bold">
@@ -1305,23 +1524,39 @@ export const CaptionsTab: React.FC<CaptionsTabProps> = ({
                     </div>
                   </div>
 
-                  {/* Large Current Letter Display */}
+                  {/* Large Current Letter Display with stability (Requirements 1, 4, 5) */}
                   <div className="flex items-center justify-center py-4 bg-[#050b1a] rounded-2xl border border-[#1a274c]">
                     <div className="flex flex-col items-center">
-                      <span className="text-6xl sm:text-7xl font-black text-white tracking-widest font-mono">
-                        {currentLetterPrediction?.letter || (detectedGesture.length === 1 ? detectedGesture : '—')}
+                      <span className={`text-6xl sm:text-7xl font-black tracking-widest font-mono ${
+                        (currentLetterPrediction?.isNeutral || detectedGesture === 'Ready')
+                          ? 'text-purple-400 text-4xl sm:text-5xl'
+                          : (currentLetterPrediction?.isUncertain || detectedGesture === '?')
+                          ? 'text-amber-400'
+                          : 'text-white'
+                      }`}>
+                        {(currentLetterPrediction?.isNeutral || detectedGesture === 'Ready')
+                          ? 'READY'
+                          : (currentLetterPrediction?.isUncertain || detectedGesture === '?')
+                          ? '?'
+                          : (currentLetterPrediction?.letter || (detectedGesture.length === 1 ? detectedGesture : '—'))}
                       </span>
-                      <span className="text-xs text-[#94a3b8] mt-2 font-medium">
-                        {currentLetterPrediction
-                          ? `Confidence: ${Math.round(currentLetterPrediction.confidence * 100)}%`
+                      <span className="text-xs text-[#94a3b8] mt-2 font-medium text-center px-4">
+                        {(currentLetterPrediction?.isNeutral || detectedGesture === 'Ready')
+                          ? 'Hand at rest / Neutral transition (ready for next sign)'
+                          : (currentLetterPrediction?.isUncertain || detectedGesture === '?')
+                          ? `Uncertain sign (dist ${currentLetterPrediction ? currentLetterPrediction.distance.toFixed(2) : ''} > threshold ${currentLetterPrediction ? currentLetterPrediction.threshold.toFixed(2) : ''} or conf < 70%)`
+                          : currentLetterPrediction
+                          ? `Confidence: ${Math.round(currentLetterPrediction.confidence * 100)}% · Dist: ${currentLetterPrediction.distance.toFixed(2)}`
                           : isStreaming
-                          ? 'Hold letter steady for 0.8s'
+                          ? 'Hold sign steady for 0.8s (or draw J/Z motion)'
+                          : signSubMode === 'type-letters'
+                          ? 'Tap keys or use keyboard'
                           : 'Camera off'}
                       </span>
                     </div>
                   </div>
 
-                  {/* Word Built From Confirmed Letters */}
+                  {/* Word Built From Confirmed Letters (Requirement 8) */}
                   <div className="space-y-2">
                     <label className="text-xs font-extrabold uppercase tracking-wider text-[#94a3b8] block">
                       Spelled Word / Phrase
@@ -1333,7 +1568,7 @@ export const CaptionsTab: React.FC<CaptionsTabProps> = ({
                     </div>
                   </div>
 
-                  {/* Controls: Space, Backspace, Clear, Speak */}
+                  {/* Controls: Space, Backspace, Clear, Speak (Requirement 8) */}
                   <div className="grid grid-cols-4 gap-2 pt-1">
                     <button
                       type="button"
@@ -1384,7 +1619,7 @@ export const CaptionsTab: React.FC<CaptionsTabProps> = ({
                   <div className="flex items-center gap-1.5">
                     <button
                       onClick={() => {
-                        const textToCopy = signSubMode === 'letters' && letterWordOutput
+                        const textToCopy = (signSubMode === 'letters' || signSubMode === 'type-letters') && letterWordOutput
                           ? letterWordOutput
                           : signToTextTranscript.join(' ');
                         navigator.clipboard?.writeText(textToCopy);
@@ -1412,8 +1647,10 @@ export const CaptionsTab: React.FC<CaptionsTabProps> = ({
                 <div className="p-4 rounded-2xl bg-[#050b1a] border border-[#1a274c] min-h-[180px] max-h-[260px] overflow-y-auto space-y-2">
                   {signToTextTranscript.length === 0 ? (
                     <p className="text-xs text-[#94a3b8] italic">
-                      {signSubMode === 'letters'
-                        ? 'No letters recognized yet. Show hand in camera or use test keys.'
+                      {signSubMode === 'type-letters'
+                        ? 'Type letters using the keyboard below or your physical keyboard.'
+                        : signSubMode === 'letters'
+                        ? 'No letters recognized yet. Show hand in camera or use keyboard.'
                         : 'No gestures recognized yet. Make a sign or click preset chips.'}
                     </p>
                   ) : (
@@ -1428,7 +1665,7 @@ export const CaptionsTab: React.FC<CaptionsTabProps> = ({
                 {/* Text-to-Speech synthesis trigger */}
                 <button
                   onClick={() => {
-                    const textToSpeak = signSubMode === 'letters' && letterWordOutput
+                    const textToSpeak = (signSubMode === 'letters' || signSubMode === 'type-letters') && letterWordOutput
                       ? letterWordOutput
                       : signToTextTranscript.join(' ');
                     const speech = new SpeechSynthesisUtterance(textToSpeak);
@@ -2087,10 +2324,11 @@ export const CaptionsTab: React.FC<CaptionsTabProps> = ({
       <LetterTrainingModal
         isOpen={isTrainingOpen}
         onClose={() => setIsTrainingOpen(false)}
-        samples={letterSamples}
-        onSamplesChange={(newSamples) => {
-          setLetterSamples(newSamples);
-          saveStoredSamples(newSamples);
+        stillSamples={trainingData.stillSamples}
+        motionSamples={trainingData.motionSamples}
+        onDataChange={(newData) => {
+          setTrainingData(newData);
+          saveStoredData(newData);
         }}
         latestLandmarksRef={latestLandmarksRef}
         latestIsLeftHandRef={latestIsLeftHandRef}

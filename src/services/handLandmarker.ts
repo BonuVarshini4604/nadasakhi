@@ -283,6 +283,22 @@ export class GestureSmoother {
   }
 }
 
+export interface DrawHandOptions {
+  motionTrail?: [number, number][];
+  showModelVision?: boolean;
+  modelVisionInfo?: {
+    nearestLetter?: string;
+    distance?: number;
+    threshold?: number;
+    confidence?: number;
+    isStill?: boolean;
+  };
+  qualityRing?: {
+    ringColor: 'green' | 'red';
+    reason?: string;
+  };
+}
+
 /**
  * Draws the 21 landmarks and the hand connections on a canvas that exactly overlays the video.
  * Draws nothing when no hand is detected.
@@ -291,9 +307,48 @@ export function drawHandLandmarks(
   ctx: CanvasRenderingContext2D,
   landmarks: NormalizedLandmark[] | null,
   width: number,
-  height: number
+  height: number,
+  options?: [number, number][] | DrawHandOptions
 ) {
   ctx.clearRect(0, 0, width, height);
+
+  // Parse options (supports backward compatibility with motionTrail array)
+  const opts: DrawHandOptions = Array.isArray(options)
+    ? { motionTrail: options }
+    : options || {};
+
+  const motionTrail = opts.motionTrail;
+
+  // Draw motion trail if provided
+  if (motionTrail && motionTrail.length > 1) {
+    ctx.beginPath();
+    ctx.strokeStyle = '#f59e0b';
+    ctx.lineWidth = 4;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.shadowColor = '#fbbf24';
+    ctx.shadowBlur = 12;
+
+    for (let k = 0; k < motionTrail.length; k++) {
+      const pt = motionTrail[k];
+      const px = pt[0] * width;
+      const py = pt[1] * height;
+      if (k === 0) {
+        ctx.moveTo(px, py);
+      } else {
+        ctx.lineTo(px, py);
+      }
+    }
+    ctx.stroke();
+
+    // Pulsing tip at end of trail
+    const last = motionTrail[motionTrail.length - 1];
+    ctx.beginPath();
+    ctx.arc(last[0] * width, last[1] * height, 7, 0, 2 * Math.PI);
+    ctx.fillStyle = '#f59e0b';
+    ctx.fill();
+    ctx.shadowBlur = 0;
+  }
 
   // Draw nothing when no hand is detected
   if (!landmarks || landmarks.length < 21) {
@@ -352,5 +407,75 @@ export function drawHandLandmarks(
       ctx.fillStyle = '#ffffff';
       ctx.fill();
     }
+
+    // 9. "Show what the model sees": draw joint numbers
+    if (opts.showModelVision) {
+      ctx.fillStyle = '#fbbf24';
+      ctx.font = 'bold 9px monospace';
+      ctx.fillText(`${index}`, x + 5, y - 4);
+    }
   });
+
+  // 7. Live feedback quality ring
+  if (opts.qualityRing) {
+    const wrist = landmarks[0];
+    const wx = wrist.x * width;
+    const wy = wrist.y * height;
+    const color = opts.qualityRing.ringColor === 'green' ? '#10b981' : '#ef4444';
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(wx, wy, 22, 0, 2 * Math.PI);
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = color;
+    ctx.shadowColor = color;
+    ctx.shadowBlur = 10;
+    ctx.stroke();
+
+    // Inner pulsing dot
+    ctx.beginPath();
+    ctx.arc(wx, wy, 4, 0, 2 * Math.PI);
+    ctx.fillStyle = color;
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // 9. Model vision stats badge
+  if (opts.showModelVision && opts.modelVisionInfo) {
+    const info = opts.modelVisionInfo;
+    ctx.save();
+    ctx.fillStyle = 'rgba(5, 11, 26, 0.85)';
+    ctx.strokeStyle = '#0ea5e9';
+    ctx.lineWidth = 1;
+
+    const boxX = 14;
+    const boxY = 14;
+    const boxW = 220;
+    const boxH = 74;
+
+    ctx.beginPath();
+    ctx.roundRect(boxX, boxY, boxW, boxH, 8);
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.fillStyle = '#38bdf8';
+    ctx.font = 'bold 11px monospace';
+    ctx.fillText('MODEL VISION DIAGNOSTIC', boxX + 8, boxY + 16);
+
+    ctx.fillStyle = '#f8fafc';
+    ctx.font = '10px monospace';
+    const nearest = info.nearestLetter || '—';
+    const distStr = info.distance !== undefined ? info.distance.toFixed(3) : '—';
+    const threshStr = info.threshold !== undefined ? info.threshold.toFixed(3) : '—';
+    const confStr = info.confidence !== undefined ? `${Math.round(info.confidence * 100)}%` : '—';
+
+    ctx.fillText(`Nearest: ${nearest} | Dist: ${distStr}`, boxX + 8, boxY + 32);
+    ctx.fillText(`Threshold: ${threshStr} | Conf: ${confStr}`, boxX + 8, boxY + 46);
+
+    const stillStr = info.isStill ? 'STEADY (still)' : 'MOVING / TRANSITION';
+    ctx.fillStyle = info.isStill ? '#34d399' : '#f87171';
+    ctx.fillText(`Motion: ${stillStr}`, boxX + 8, boxY + 60);
+
+    ctx.restore();
+  }
 }
